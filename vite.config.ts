@@ -5,16 +5,19 @@ import tailwindcss from "@tailwindcss/vite";
 import tsconfigPaths from "vite-tsconfig-paths";
 import { nitro } from "nitro/vite";
 
+const isPages = process.env["GITHUB_PAGES"] === "true";
+
 export default defineConfig(({ command }) => ({
+  base: isPages ? "/rag-deadlock-simulator/" : "/",
   plugins: [
     tsconfigPaths(),
-    tanstackStart({
-      // Use src/server.ts as the server entry (SSR error wrapper).
-      server: { entry: "server" },
-    }),
+    tanstackStart(
+      isPages
+        ? { spa: { enabled: true } }
+        : { server: { entry: "server" } },
+    ),
     viteReact(),
     tailwindcss(),
-    // Production server bundle only; preset is auto-detected from the host (Vercel, Netlify, Node, ...).
-    ...(command === "build" ? [nitro()] : []),
+    ...(command === "build" && !isPages ? [nitro()] : []),
   ],
 }));
