@@ -1,5 +1,6 @@
 export type NodeType = "process" | "resource";
 export type EdgeType = "request" | "assignment";
+export type Algorithm = "auto" | "dfs" | "reduction" | "ranked";
 
 export interface RagNode {
   id: string;
@@ -17,12 +18,7 @@ export interface RagEdge {
   type: EdgeType;
 }
 
-export type DetectionStatus =
-  | "idle"
-  | "no-cycle"
-  | "deadlock"
-  | "checking-safety"
-  | "safe";
+export type DetectionStatus = "idle" | "no-cycle" | "deadlock" | "checking-safety" | "safe";
 
 export interface DetectionResult {
   status: Exclude<DetectionStatus, "idle" | "checking-safety">;
@@ -30,6 +26,23 @@ export interface DetectionResult {
   cycle: string[];
   cycleNodeIds: string[];
   cycleEdgeIds: string[];
+}
+
+export interface AlgorithmMetrics {
+  algorithm: Algorithm;
+  verdict: "deadlock" | "safe" | "no-cycle" | "inconclusive";
+  nodesVisited: number;
+  edgesExamined: number;
+  checks: number;
+  passes: number;
+  reductions: number;
+  remainingProcesses: string[];
+  cycle: string[];
+  cycleNodeIds: string[];
+  cycleEdgeIds: string[];
+  multiInstance: boolean;
+  note?: string;
+  timeMs: number;
 }
 
 export function isMultiInstance(nodes: RagNode[]): boolean {
@@ -94,49 +107,7 @@ function cycleEdgeIds(cycle: string[], edges: RagEdge[]): string[] {
  * Returns true when every process can be reduced (no true deadlock).
  */
 export function canFullyReduce(nodes: RagNode[], edges: RagEdge[]): boolean {
-  const resources = nodes.filter((n) => n.type === "resource");
-  const processes = nodes.filter((n) => n.type === "process");
-
-  const available = new Map<string, number>();
-  for (const r of resources) {
-    const allocated = edges.filter(
-      (e) => e.type === "assignment" && e.from === r.id,
-    ).length;
-    available.set(r.id, r.instances - allocated);
-  }
-
-  const reduced = new Set<string>();
-  let progress = true;
-  while (progress) {
-    progress = false;
-    for (const p of processes) {
-      if (reduced.has(p.id)) continue;
-      const requests = edges.filter(
-        (e) => e.type === "request" && e.from === p.id,
-      );
-      const need = new Map<string, number>();
-      for (const req of requests) {
-        need.set(req.to, (need.get(req.to) ?? 0) + 1);
-      }
-      let satisfiable = true;
-      for (const [rid, count] of need) {
-        if ((available.get(rid) ?? 0) < count) {
-          satisfiable = false;
-          break;
-        }
-      }
-      if (!satisfiable) continue;
-
-      for (const e of edges) {
-        if (e.type === "assignment" && e.to === p.id) {
-          available.set(e.from, (available.get(e.from) ?? 0) + 1);
-        }
-      }
-      reduced.add(p.id);
-      progress = true;
-    }
-  }
-  return reduced.size === processes.length;
+  return reductionMetrics(nodes, edges, false).remainingProcesses.length === 0;
 }
 
 export function detect(nodes: RagNode[], edges: RagEdge[]): DetectionResult {
@@ -173,6 +144,218 @@ export function detect(nodes: RagNode[], edges: RagEdge[]): DetectionResult {
     cycle,
     cycleNodeIds: nodeIds,
     cycleEdgeIds: edgeIds,
+  };
+}
+
+function reductionMetrics(
+  nodes: RagNode[],
+  edges: RagEdge[],
+  ranked: boolean,
+): Pick<AlgorithmMetrics, "checks" | "passes" | "reductions" | "remainingProcesses"> {
+  const resources = nodes.filter((n) => n.type === "resource");
+  const processes = nodes.filter((n) => n.type === "process");
+  const available = new Map<string, number>();
+  for (const resource of resources) {
+    available.set(resource.id, resource.instances);
+  }
+
+  const requests = new Map<string, Map<string, number>>();
+  const holdings = new Map<string, string[]>();
+  for (const process of processes) {
+    requests.set(process.id, new Map());
+    holdings.set(process.id, []);
+  }
+  for (const edge of edges) {
+    if (edge.type === "request" && requests.has(edge.from)) {
+      const need = requests.get(edge.from);
+      if (need) need.set(edge.to, (need.get(edge.to) ?? 0) + 1);
+    } else if (edge.type === "assignment") {
+      if (available.has(edge.from)) {
+        available.set(edge.from, (available.get(edge.from) ?? 0) - 1);
+      }
+      holdings.get(edge.to)?.push(edge.from);
+    }
+  }
+
+  const order = ranked
+    ? [...processes].sort(
+        (a, b) =>
+          [...(requests.get(a.id)?.values() ?? [])].reduce((sum, count) => sum + count, 0) -
+          [...(requests.get(b.id)?.values() ?? [])].reduce((sum, count) => sum + count, 0),
+      )
+    : processes;
+  const unfinished = new Set(processes.map((process) => process.id));
+  let checks = 0;
+  let passes = 0;
+  let reductions = 0;
+
+  while (unfinished.size > 0) {
+    passes += 1;
+    let reducedThisPass = false;
+    for (const process of order) {
+      if (!unfinished.has(process.id)) continue;
+      checks += 1;
+      const need = requests.get(process.id) ?? new Map();
+      const canFinish = [...need].every(
+        ([resourceId, count]) => (available.get(resourceId) ?? 0) >= count,
+      );
+      if (!canFinish) continue;
+
+      for (const resourceId of holdings.get(process.id) ?? []) {
+        available.set(resourceId, (available.get(resourceId) ?? 0) + 1);
+      }
+      unfinished.delete(process.id);
+      reductions += 1;
+      reducedThisPass = true;
+    }
+    if (!reducedThisPass) break;
+  }
+
+  return {
+    checks,
+    passes,
+    reductions,
+    remainingProcesses: processes
+      .filter((process) => unfinished.has(process.id))
+      .map((process) => process.label),
+  };
+}
+
+function executeAlgorithm(
+  algorithm: Algorithm,
+  nodes: RagNode[],
+  edges: RagEdge[],
+): Omit<AlgorithmMetrics, "timeMs"> {
+  const multiInstance = isMultiInstance(nodes);
+  if (algorithm === "dfs") {
+    const dfs = findCycleCounted(nodes, edges);
+    return {
+      algorithm,
+      multiInstance,
+      ...dfs,
+      cycleNodeIds: dfs.cycle,
+      checks: 0,
+      passes: 0,
+      reductions: 0,
+      remainingProcesses: [],
+      verdict: dfs.cycle.length === 0 ? "no-cycle" : multiInstance ? "inconclusive" : "deadlock",
+      ...(multiInstance && dfs.cycle.length > 0
+        ? { note: "A cycle is not always a deadlock with multiple instances." }
+        : {}),
+    };
+  }
+
+  if (algorithm === "reduction" || algorithm === "ranked") {
+    const reduction = reductionMetrics(nodes, edges, algorithm === "ranked");
+    return {
+      algorithm,
+      multiInstance,
+      cycle: [],
+      cycleNodeIds: [],
+      cycleEdgeIds: [],
+      nodesVisited: 0,
+      edgesExamined: 0,
+      ...reduction,
+      verdict: reduction.remainingProcesses.length > 0 ? "deadlock" : "safe",
+    };
+  }
+
+  const result = detect(nodes, edges);
+  return {
+    algorithm,
+    multiInstance,
+    nodesVisited: 0,
+    edgesExamined: 0,
+    checks: 0,
+    passes: 0,
+    reductions: 0,
+    remainingProcesses: [],
+    verdict:
+      result.status === "deadlock" ? "deadlock" : result.status === "safe" ? "safe" : "no-cycle",
+    cycle: result.cycle,
+    cycleNodeIds: result.cycleNodeIds,
+    cycleEdgeIds: result.cycleEdgeIds,
+  };
+}
+
+function findCycleCounted(
+  nodes: RagNode[],
+  edges: RagEdge[],
+): {
+  cycle: string[];
+  cycleEdgeIds: string[];
+  nodesVisited: number;
+  edgesExamined: number;
+} {
+  const adjacency = buildAdjacency(edges);
+  const state = new Map<string, 0 | 1 | 2>();
+  const stack: string[] = [];
+  let cycle: string[] = [];
+  let nodesVisited = 0;
+  let edgesExamined = 0;
+  const visit = (id: string): boolean => {
+    state.set(id, 1);
+    stack.push(id);
+    nodesVisited += 1;
+    for (const { to } of adjacency.get(id) ?? []) {
+      edgesExamined += 1;
+      const targetState = state.get(to) ?? 0;
+      if (targetState === 1) {
+        cycle = stack.slice(stack.indexOf(to));
+        return true;
+      }
+      if (targetState === 0 && visit(to)) return true;
+    }
+    stack.pop();
+    state.set(id, 2);
+    return false;
+  };
+  for (const node of nodes) {
+    if ((state.get(node.id) ?? 0) === 0 && visit(node.id)) break;
+  }
+  return {
+    cycle,
+    cycleEdgeIds: cycle.flatMap((from, index) => {
+      const to = cycle[(index + 1) % cycle.length];
+      const edge = edges.find((candidate) => candidate.from === from && candidate.to === to);
+      return edge ? [edge.id] : [];
+    }),
+    nodesVisited,
+    edgesExamined,
+  };
+}
+
+/** Execute an algorithm and report the mean runtime over 200 repetitions. */
+export function runAlgorithm(
+  algorithm: Algorithm,
+  nodes: RagNode[],
+  edges: RagEdge[],
+): AlgorithmMetrics {
+  const repetitions = 200;
+  const started = performance.now();
+  let result: Omit<AlgorithmMetrics, "timeMs"> | undefined;
+  for (let iteration = 0; iteration < repetitions; iteration += 1) {
+    result = executeAlgorithm(algorithm, nodes, edges);
+  }
+  if (algorithm === "auto" && result?.multiInstance && result.cycle.length > 0) {
+    result = { ...result, ...reductionMetrics(nodes, edges, false) };
+  }
+  if (algorithm === "reduction" || algorithm === "ranked") {
+    const cycle = findCycle(nodes, edges);
+    result = {
+      ...result!,
+      cycle,
+      cycleNodeIds: cycle,
+      cycleEdgeIds: cycle.flatMap((from, index) => {
+        const to = cycle[(index + 1) % cycle.length];
+        const edge = edges.find((candidate) => candidate.from === from && candidate.to === to);
+        return edge ? [edge.id] : [];
+      }),
+    };
+  }
+  return {
+    ...result!,
+    timeMs: (performance.now() - started) / repetitions,
   };
 }
 
